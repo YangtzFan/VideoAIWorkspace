@@ -3,6 +3,9 @@
 from __future__ import annotations
 
 import argparse
+import ctypes
+import importlib.util
+import os
 import sys
 from pathlib import Path
 
@@ -11,6 +14,8 @@ BASE_DIR = Path(__file__).resolve().parent.parent
 DEFAULT_AUDIO_DIR = BASE_DIR / "audios"
 DEFAULT_TEXT_DIR = BASE_DIR / "texts"
 AUDIO_EXTENSIONS = {".mp3", ".wav", ".m4a", ".flac", ".ogg", ".opus", ".aac"}
+CUDA_DLL_DIRECTORY_HANDLES: list[object] = []
+CUDA_LIBRARY_HANDLES: list[object] = []
 
 
 def parse_args() -> argparse.Namespace:
@@ -41,9 +46,9 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--device",
-        choices=("cpu", "cuda"),
-        default="cpu",
-        help="推理设备（默认：cpu）",
+        choices=("auto", "cpu", "cuda"),
+        default="auto",
+        help="推理设备；auto 优先使用 CUDA，不可用时回退 CPU（默认：auto）",
     )
     parser.add_argument(
         "--compute-type",
@@ -82,6 +87,67 @@ def transcribe(model: object, audio_file: Path, language: str) -> tuple[str, str
     return text, str(info.language), probability
 
 
+def configure_cuda_dll_paths() -> None:
+    """Expose CUDA DLLs installed by NVIDIA's Python packages on Windows."""
+    if sys.platform != "win32" or CUDA_DLL_DIRECTORY_HANDLES:
+        return
+
+    dll_directories: dict[str, Path] = {}
+    for module_name in ("nvidia.cublas", "nvidia.cuda_runtime"):
+        try:
+            spec = importlib.util.find_spec(module_name)
+        except (ImportError, ModuleNotFoundError):
+            continue
+        if spec is None or spec.submodule_search_locations is None:
+            continue
+        for module_directory in spec.submodule_search_locations:
+            dll_directory = Path(module_directory) / "bin"
+            if dll_directory.is_dir():
+                dll_directories[module_name] = dll_directory
+                CUDA_DLL_DIRECTORY_HANDLES.append(
+                    os.add_dll_directory(str(dll_directory))
+                )
+
+    libraries = (
+        ("nvidia.cuda_runtime", "cudart64_12.dll"),
+        ("nvidia.cublas", "cublasLt64_12.dll"),
+        ("nvidia.cublas", "cublas64_12.dll"),
+    )
+    for module_name, library_name in libraries:
+        dll_directory = dll_directories.get(module_name)
+        if dll_directory is None:
+            continue
+        library_path = dll_directory / library_name
+        if library_path.is_file():
+            try:
+                CUDA_LIBRARY_HANDLES.append(ctypes.WinDLL(str(library_path)))
+            except OSError:
+                pass
+
+
+def cuda_is_available() -> bool:
+    try:
+        import ctranslate2
+
+        return ctranslate2.get_cuda_device_count() > 0
+    except Exception:
+        return False
+
+
+def load_model(
+    model_name: str, device: str, requested_compute_type: str | None
+) -> tuple[object, str]:
+    from faster_whisper import WhisperModel
+
+    compute_type = requested_compute_type or ("float16" if device == "cuda" else "int8")
+    print(
+        f"正在加载模型 {model_name}（device={device}, "
+        f"compute_type={compute_type}）..."
+    )
+    model = WhisperModel(model_name, device=device, compute_type=compute_type)
+    return model, compute_type
+
+
 def main() -> int:
     args = parse_args()
     input_dir = args.input_dir.resolve()
@@ -111,8 +177,11 @@ def main() -> int:
         print(f"无需转写，{len(audio_files)} 个音频均已有对应文本。")
         return 0
 
+    if args.device != "cpu":
+        configure_cuda_dll_paths()
+
     try:
-        from faster_whisper import WhisperModel
+        import faster_whisper  # noqa: F401
     except ImportError:
         print(
             "错误：缺少 faster-whisper。请运行 "
@@ -121,20 +190,27 @@ def main() -> int:
         )
         return 1
 
-    compute_type = args.compute_type or ("int8" if args.device == "cpu" else "float16")
-    print(
-        f"正在加载模型 {args.model}（device={args.device}, "
-        f"compute_type={compute_type}）..."
-    )
+    device = args.device
+    allow_cpu_fallback = device == "auto"
+    if device == "auto":
+        device = "cuda" if cuda_is_available() else "cpu"
+        if device == "cpu":
+            print("未检测到可用的 CUDA 设备，将使用 CPU。")
+
     try:
-        model = WhisperModel(
-            args.model,
-            device=args.device,
-            compute_type=compute_type,
-        )
+        model, compute_type = load_model(args.model, device, args.compute_type)
     except Exception as exc:
-        print(f"错误：模型加载失败：{exc}", file=sys.stderr)
-        return 1
+        if allow_cpu_fallback and device == "cuda":
+            print(f"CUDA 模型加载失败，将回退到 CPU：{exc}", file=sys.stderr)
+            device = "cpu"
+            try:
+                model, compute_type = load_model(args.model, device, None)
+            except Exception as cpu_exc:
+                print(f"错误：CPU 模型加载失败：{cpu_exc}", file=sys.stderr)
+                return 1
+        else:
+            print(f"错误：模型加载失败：{exc}", file=sys.stderr)
+            return 1
 
     failures = 0
     for index, audio_file in enumerate(pending_files, start=1):
@@ -144,7 +220,15 @@ def main() -> int:
         temporary_file = text_file.with_suffix(".tmp.txt")
         temporary_file.unlink(missing_ok=True)
         try:
-            text, language, probability = transcribe(model, audio_file, args.language)
+            try:
+                text, language, probability = transcribe(model, audio_file, args.language)
+            except Exception as cuda_exc:
+                if not (allow_cpu_fallback and device == "cuda"):
+                    raise
+                print(f"  CUDA 推理失败，将回退到 CPU：{cuda_exc}", file=sys.stderr)
+                device = "cpu"
+                model, compute_type = load_model(args.model, device, None)
+                text, language, probability = transcribe(model, audio_file, args.language)
             temporary_file.write_text(text + ("\n" if text else ""), encoding="utf-8")
             temporary_file.replace(text_file)
             print(
