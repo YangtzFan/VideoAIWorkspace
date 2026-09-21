@@ -1,4 +1,6 @@
 .venv/
+.xmake/
+build/
 __pycache__/
 *.py[cod]
 videos/

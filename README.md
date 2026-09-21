@@ -15,6 +15,7 @@ texts/001_xxx.txt
 ## 环境要求
 
 - Python 3.9 或更高版本
+- Xmake 3.1 或更高版本
 - 首次转写时可以访问 Hugging Face，以下载 Whisper 模型
 - 可选：系统 FFmpeg。没有安装时，程序自动使用 `imageio-ffmpeg` 附带的版本
 - 可选：支持 CUDA 的 NVIDIA 显卡及其驱动。程序默认优先使用 CUDA，CUDA 不可用时自动回退到 CPU
@@ -33,6 +34,8 @@ Windows 上如需使用 NVIDIA GPU，请继续安装项目测试过的 CUDA 12.8
 ```powershell
 python -m pip install -r requirements-gpu.txt
 ```
+
+本机已将 Xmake 安装到 `D:\xmake` 并加入当前用户 `PATH`，同时设置 `XMAKE_GLOBALDIR=D:\xmake` 和 `XMAKE_TMPDIR=D:\xmake\tmp`，使 Xmake 的全局缓存和临时文件也保存在 D 盘。新终端可以直接运行 `xmake --version`；如果当前终端尚未刷新环境变量，可以使用 `D:\xmake\xmake.exe`。
 
 ## 快速开始
 
@@ -56,6 +59,26 @@ python -m pip install -r requirements-gpu.txt
 ```powershell
 python scripts\audio_to_txt.py --language zh
 ```
+
+也可以通过 Xmake 执行各阶段或完整流程：
+
+```powershell
+xmake run extract-audio
+xmake run transcribe
+xmake run pipeline
+```
+
+Xmake 会优先使用项目 `.venv` 中的 Python，未找到虚拟环境时使用系统 `python`。
+
+## 清理生成文件
+
+运行以下命令可一键删除 `audios` 和 `texts` 中的生成文件、Python 缓存及 Xmake 构建产物：
+
+```powershell
+xmake clean
+```
+
+清理后会重新创建空的 `audios` 和 `texts` 目录。`videos` 目录及其中由用户放入的所有视频不会被删除，`.venv` 也会保留。
 
 ## 设备选择
 
@@ -85,6 +108,7 @@ VideoWorkspace/
 │   └── audio_to_txt.md
 ├── requirements.txt
 ├── requirements-gpu.txt
+├── xmake.lua
 └── README.md
 ```
 
